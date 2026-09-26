@@ -1,0 +1,15 @@
+{
+  "portal_host": "10.60.200.35",
+  "portal_port": 801,
+  "account": "",
+  "password": "",
+  "account_prefix": ",0,",
+  "enable_md5": false,
+  "user_ip": "",
+  "user_mac": "",
+  "ac_ip": "",
+  "timeout": 6,
+  "retry": 3,
+  "interval": 30,
+  "auto_watch": false
+}

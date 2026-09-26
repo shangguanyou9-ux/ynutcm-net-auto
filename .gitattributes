@@ -1,0 +1,11 @@
+# 统一行尾，避免 Windows 下 .bat 因 LF 出错
+* text=auto
+
+*.py   text eol=lf
+*.json text eol=lf
+*.md   text eol=lf
+*.bat  text eol=crlf
+
+*.exe  binary
+*.ico  binary
+*.png  binary
