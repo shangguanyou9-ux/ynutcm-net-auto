@@ -153,6 +153,9 @@ class MainWindow(QWidget):
         self.worker = None
         self._task = ""
         self._last_status = None
+        self._pending = None        # 排队等待启动的任务，防止被正在跑的任务挤掉
+        self._closing = False
+        self._auto_resume = False
 
         self.setWindowTitle(APP_NAME)
         self.setMinimumSize(700, 580)
@@ -160,9 +163,19 @@ class MainWindow(QWidget):
         self._build_ui()
         self._fill_ui(cfg)
 
-        QTimer.singleShot(300, lambda: self._start("status"))
         if cfg.get("auto_watch"):
-            QTimer.singleShot(1200, lambda: self.btn_watch.setChecked(True))
+            # 自动重连模式直接进守护：守护循环第一轮本身就会做状态检测，
+            # 不能再另外发一个 status 任务——它会占着线程把 watch 请求挤掉，
+            # 结果就是复选框勾着、守护却没跑起来。
+            QTimer.singleShot(200, self._resume_auto_watch)
+        else:
+            QTimer.singleShot(300, lambda: self._start("status"))
+
+    def _resume_auto_watch(self) -> None:
+        """启动时恢复自动重连：勾上复选框，toggled 会去启动守护任务。"""
+        self._auto_resume = True
+        self.btn_watch.setChecked(True)
+        self._auto_resume = False
 
     # ---------------- 界面搭建 ----------------
 
@@ -361,14 +374,27 @@ class MainWindow(QWidget):
         self.btn_status.setDisabled(busy)
         self.btn_logout.setDisabled(busy)
 
+    def _is_busy(self) -> bool:
+        return self.worker is not None and self.worker.isRunning()
+
     def _start(self, task: str) -> None:
-        if self.worker is not None and self.worker.isRunning():
-            self.append_log("[提示] 上一个任务还没结束，请稍候。")
+        if self._is_busy():
+            if task == "watch":
+                # 不能直接丢掉：先排队，等当前任务收尾再启动，
+                # 否则界面勾上了“自动重连”，守护模式其实没跑
+                self._pending = "watch"
+                self.append_log("[提示] 正在等待当前任务结束，随后开启自动重连…")
+            else:
+                self.append_log("[提示] 上一个任务还没结束，请稍候。")
             return
 
         cfg = self._collect()
         if task in ("connect", "watch", "logout") and not (cfg["account"] and cfg["password"]):
-            QMessageBox.warning(self, "缺少信息", "请先填写账号和密码。")
+            if self._auto_resume:
+                # 开机自动恢复时不弹模态框打断用户
+                self.append_log("[提示] 自动重连已启用，但还没填账号密码，填好后点“保存配置”。")
+            else:
+                QMessageBox.warning(self, "缺少信息", "请先填写账号和密码。")
             if task == "watch":
                 self.btn_watch.setChecked(False)
             return
@@ -388,6 +414,7 @@ class MainWindow(QWidget):
         self.worker.logged.connect(self.append_log)
         self.worker.status.connect(self._on_status)
         self.worker.done.connect(self._on_done)
+        self.worker.finished.connect(self._on_thread_finished)
         self.worker.start()
 
     def _toggle_watch(self, checked: bool) -> None:
@@ -396,7 +423,8 @@ class MainWindow(QWidget):
             self._start("watch")
         else:
             self.btn_watch.setText("自动重连")
-            if self.worker is not None and self.worker.isRunning():
+            self._pending = None          # 撤销还没轮到的守护启动
+            if self._is_busy():
                 self.append_log("[提示] 正在停止自动重连…")
                 self.worker.stop()
 
@@ -411,9 +439,22 @@ class MainWindow(QWidget):
                 self._set_state(self._last_status)   # 停掉守护后仍然显示真实网络状态
             else:
                 self._set_state("unknown", "已停止", "自动重连已关闭")
+
+    def _on_thread_finished(self) -> None:
+        # 线程真正结束后再收尾并启动排队中的任务，避免 isRunning() 还没翻转
+        finished, self.worker = self.worker, None
+        if finished is not None:
+            finished.deleteLater()      # 长期挂机时别让 QThread 对象越攒越多
         self._busy(False)
+        if self._closing:
+            return
+        if self._pending:
+            task, self._pending = self._pending, None
+            QTimer.singleShot(0, lambda t=task: self._start(t))
 
     def closeEvent(self, event) -> None:
+        self._closing = True
+        self._pending = None
         if self.worker is not None and self.worker.isRunning():
             self.worker.stop()
             self.worker.wait(3000)
