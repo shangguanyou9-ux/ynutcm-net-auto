@@ -367,59 +367,86 @@ def do_logout(session: requests.Session, cfg: dict, info: dict, debug: bool = Fa
 # 业务编排
 # --------------------------------------------------------------------------
 
-def connect_once(cfg: dict, debug: bool = False, should_stop=None) -> bool:
+def _connect_round(cfg: dict, debug: bool = False, should_stop=None, quiet: bool = False):
+    """
+    跑一轮：查状态 → 需要就补认证。
+
+    返回 (online, relogged)：
+        online   本轮结束时是否在线
+        relogged 本轮是否真的成功重连了一次（"已经在线"不算）
+
+    quiet=True 时不输出过程日志，只留给调用方报汇总（守护模式用）；
+    但 debug=True 时照常输出，方便排查。
+    """
+    def say(msg: str) -> None:
+        if not quiet or debug:
+            log(msg)
+
     session = build_session(cfg)
 
     status = get_status(session, cfg, debug)
     if status is True:
-        log("当前已在线，无需登录。")
-        return True
+        say("当前已在线，无需登录。")
+        return True, False
 
     info = discover_info(session, cfg, debug)
-    log("用户 IP={userip}  MAC={usermac}  AC IP={nasip}".format(**info))
+    say("用户 IP={userip}  MAC={usermac}  AC IP={nasip}".format(**info))
     if not info.get("nasip"):
-        log("警告：没探测到 AC IP（wlan_ac_ip），认证可能失败，可在 config.json 里手填 ac_ip。")
+        say("警告：没探测到 AC IP（wlan_ac_ip），认证可能失败，可在 config.json 里手填 ac_ip。")
 
     for i in range(1, max(1, int(cfg.get("retry", 3))) + 1):
         if should_stop and should_stop():
-            return False
+            return False, False
         ok, msg = do_login(session, cfg, info, debug)
-        log("第 {} 次认证：{} {}".format(i, "成功" if ok else "失败", msg))
+        say("第 {} 次认证：{} {}".format(i, "成功" if ok else "失败", msg))
         if ok:
             _sleep(0.5, should_stop)
             if get_status(session, cfg, debug) is not False:
-                return True
-            log("认证接口返回成功，但状态检测仍未在线，稍后重试……")
+                return True, True
+            say("认证接口返回成功，但状态检测仍未在线，稍后重试……")
         if not _sleep(1, should_stop):
-            return False
+            return False, False
 
-    return False
+    return False, False
+
+
+def connect_once(cfg: dict, debug: bool = False, should_stop=None) -> bool:
+    """单次：查状态，掉线就补认证。命令行和界面上的“立即连接”都用它。"""
+    online, _ = _connect_round(cfg, debug, should_stop, quiet=False)
+    return online
 
 
 def watch(cfg: dict, debug: bool = False, should_stop=None, on_status=None) -> None:
     """
-    守护模式：循环检查并自动补认证。
+    守护模式：循环检查并自动补认证，日志只报两个计数，不刷过程细节。
+
     should_stop: 返回 True 时退出（GUI 用它来“停止自动重连”）。
     on_status:   每轮结束后回调 True/False，GUI 用它刷新状态灯。
     """
     interval = max(5, int(cfg.get("interval", 30)))
+    checks = 0
+    reconnects = 0
     log("进入守护模式，每 {} 秒检查一次。".format(interval))
     while True:
         if should_stop and should_stop():
             break
-        status = None
+        checks += 1
+        online = None
         try:
-            status = connect_once(cfg, debug, should_stop=should_stop)
+            online, relogged = _connect_round(cfg, debug, should_stop, quiet=True)
+            if relogged:
+                reconnects += 1
         except Exception as exc:  # 守护模式别被单次异常打断
-            log("本轮异常：{}".format(exc))
-        if on_status is not None and status is not None:
+            log("[守护] 本轮异常：{}".format(exc))
+        log("[守护] 已检查 {} 次，重连成功 {} 次".format(checks, reconnects))
+        if on_status is not None and online is not None:
             try:
-                on_status(status)
+                on_status(online)
             except Exception:
                 pass
         if not _sleep(interval, should_stop):
             break
-    log("已退出守护模式。")
+    log("[守护] 已退出，共检查 {} 次，重连成功 {} 次".format(checks, reconnects))
 
 
 # --------------------------------------------------------------------------
